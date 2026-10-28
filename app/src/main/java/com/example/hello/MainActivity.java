@@ -49,6 +49,18 @@ public class MainActivity extends Activity {
     TextView numberView, nameView;
     ImageView backBtn, addBtn;
     List<Row> contactCache;
+    int contactCacheVer = -1;
+    boolean preloading;
+    List<Row> recentsCache;
+    int recentsFilter = -1, recentsGen = 0, restoreTab = -1;
+    // call log and contacts are read here so scrolling and tab switches don't wait on the database
+    final java.util.concurrent.ExecutorService bg = java.util.concurrent.Executors.newSingleThreadExecutor();
+    // the contacts list only needs rebuilding when the contacts actually change
+    final android.database.ContentObserver contactObs = new android.database.ContentObserver(
+            new android.os.Handler(android.os.Looper.getMainLooper())) {
+        @Override public void onChange(boolean selfChange) { contactCache = null; contactGen++; }
+    };
+    int contactGen = 0;
     static boolean unlocked = false;
     static long leftAt = 0;
     boolean locking = false;
@@ -83,8 +95,17 @@ public class MainActivity extends Activity {
         getWindow().setBackgroundDrawable(new ColorDrawable(Ui.BG));
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
                 | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-        Uri data = getIntent().getData();
-        if (data != null && "tel".equals(data.getScheme())) num.append(data.getSchemeSpecificPart());
+        try {
+            getContentResolver().registerContentObserver(ContactsContract.Contacts.CONTENT_URI, true, contactObs);
+        } catch (Throwable e) { }
+        if (s != null && s.containsKey("num")) {
+            // recreated (rotation, theme change): keep what was typed and the tab that was open
+            num.append(s.getString("num", ""));
+            restoreTab = s.getInt("tab", -1);
+        } else {
+            Uri data = getIntent().getData();
+            if (data != null && "tel".equals(data.getScheme())) num.append(data.getSchemeSpecificPart());
+        }
 
         SharedPreferences sp = getSharedPreferences("app", MODE_PRIVATE);
         if (!sp.getBoolean("onboarded", false)) {
@@ -111,7 +132,7 @@ public class MainActivity extends Activity {
         root.addView(content, new LinearLayout.LayoutParams(MATCH, 0, 1));
         root.addView(tabBar(), new LinearLayout.LayoutParams(MATCH, WRAP));
         setContentView(root);
-        show(num.length() > 0 ? KEYPAD : HOME);
+        show(num.length() > 0 ? KEYPAD : restoreTab >= 0 && restoreTab <= MORE ? restoreTab : HOME);
         lockCover = new View(this);
         lockCover.setBackgroundColor(Ui.BG);
         lockCover.setClickable(true);
@@ -137,6 +158,12 @@ public class MainActivity extends Activity {
             }
             return;
         }
+        if (c == 2) {
+            // a speed-dial / voicemail press that was waiting for the Phone permission
+            String k = SpeedDial.pendingKey;
+            SpeedDial.pendingKey = null;
+            if (k != null && has(Manifest.permission.CALL_PHONE)) { SpeedDial.press(this, k); return; }
+        }
         askDefaultDialer();
     }
 
@@ -152,14 +179,23 @@ public class MainActivity extends Activity {
                 + (sp.getBoolean("a11y_bold", false) ? 200000 : 0);
         if (themeSeen == -1) themeSeen = key;
         else if (key != themeSeen) { themeSeen = key; recreate(); return; }
-        contactCache = null;
+        preloadContacts();
         if (tab != KEYPAD) refreshKeep();
         checkLock();
     }
 
     @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putString("num", num.toString());
+        out.putInt("tab", tab);
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
+        try { getContentResolver().unregisterContentObserver(contactObs); } catch (Throwable e) { }
+        bg.shutdownNow();
         if (tone != null) { tone.release(); tone = null; }
         try { if (tts != null) { tts.shutdown(); tts = null; } } catch (Throwable e) { }
     }
@@ -629,12 +665,10 @@ public class MainActivity extends Activity {
 
     void deleteLog(String n) {
         try {
-            String dk = Favs.key(n);
-            if (dk.isEmpty()) getContentResolver().delete(CallLog.Calls.CONTENT_URI,
-                    CallLog.Calls.NUMBER + "=?", new String[]{n});
-            else getContentResolver().delete(CallLog.Calls.CONTENT_URI,
-                    CallLog.Calls.NUMBER + " LIKE ?", new String[]{"%" + dk});
-            toast("Deleted");
+            int rows = getContentResolver().delete(CallLog.Calls.CONTENT_URI,
+                    Favs.logSel(n), Favs.logArgs(n));
+            toast(rows > 0 ? "Deleted" : "Nothing to delete");
+            recentsCache = null; // don't flash the deleted entry from the cached list
             show(tab);
         } catch (Exception e) {
             toast("Can't delete: set Dialer as the default phone app");
@@ -648,6 +682,7 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Clear", (d, i) -> {
                     try {
                         getContentResolver().delete(CallLog.Calls.CONTENT_URI, null, null);
+                        recentsCache = null;
                         show(tab);
                     } catch (Exception e) {
                         toast("Can't clear: set Dialer as the default phone app");
@@ -1189,13 +1224,64 @@ public class MainActivity extends Activity {
         col.addView(chipBar(new String[]{"All", "Missed", "Incoming", "Outgoing"}, filter,
                 i -> { filter = i; if (i == 1) markMissedRead(); renderHome(body); }), new LinearLayout.LayoutParams(MATCH, WRAP));
 
-        List<Row> rows = loadRecents();
-        if (rows.isEmpty()) {
-            col.addView(emptyView("📞", filter == 1 ? "No missed calls" : "No calls to show"),
-                    new LinearLayout.LayoutParams(MATCH, 0, 1));
-        } else {
-            col.addView(list(rows, true), new LinearLayout.LayoutParams(MATCH, 0, 1));
+        // show what was loaded last time straight away, then refresh from the call log in the background
+        final FrameLayout slot = new FrameLayout(this);
+        col.addView(slot, new LinearLayout.LayoutParams(MATCH, 0, 1));
+        if (recentsCache != null && recentsFilter == filter) applyRecents(slot, recentsCache, false);
+        loadRecentsAsync(slot);
+    }
+
+    void applyRecents(FrameLayout slot, List<Row> rows, boolean keepScroll) {
+        int pos = 0, top = 0;
+        if (keepScroll) {
+            ListView old = findList(slot);
+            if (old != null) {
+                pos = old.getFirstVisiblePosition();
+                View c0 = old.getChildAt(0);
+                top = c0 == null ? 0 : c0.getTop();
+            }
         }
+        slot.removeAllViews();
+        if (rows.isEmpty()) {
+            slot.addView(emptyView("📞", filter == 1 ? "No missed calls" : "No calls to show"),
+                    new FrameLayout.LayoutParams(MATCH, MATCH));
+            return;
+        }
+        final ListView lv = list(rows, true);
+        slot.addView(lv, new FrameLayout.LayoutParams(MATCH, MATCH));
+        if (pos > 0) {
+            final int p = pos, t = top;
+            lv.post(() -> lv.setSelectionFromTop(p, t));
+        }
+    }
+
+    void loadRecentsAsync(final FrameLayout slot) {
+        final int gen = ++recentsGen;
+        final int f = filter;
+        try {
+            bg.execute(() -> {
+                final List<Row> rows = loadRecents();
+                runOnUiThread(() -> {
+                    // ignore the result if the screen moved on while the call log was being read
+                    if (isDestroyed() || gen != recentsGen || tab != HOME || !slot.isAttachedToWindow()) return;
+                    boolean shown = recentsCache != null && recentsFilter == f;
+                    boolean same = shown && sameRows(recentsCache, rows);
+                    recentsCache = rows;
+                    recentsFilter = f;
+                    if (!same) applyRecents(slot, rows, shown);
+                });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) { }
+    }
+
+    static boolean sameRows(List<Row> a, List<Row> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            Row x = a.get(i), y = b.get(i);
+            if (!Objects.equals(x.title, y.title) || !Objects.equals(x.sub, y.sub)
+                    || !Objects.equals(x.number, y.number)) return false;
+        }
+        return true;
     }
 
     void renderSearch(FrameLayout body, String q) {
@@ -1244,9 +1330,40 @@ public class MainActivity extends Activity {
     }
 
     List<Row> allContacts() {
-        if (contactCache != null) return contactCache;
+        // the cached list is also dropped when favourites change, because it carries the star next to a name
+        if (contactCache != null && contactCacheVer == Favs.version) return contactCache;
+        int ver = Favs.version;
+        List<Row> rows = buildContacts();
+        contactCache = rows;
+        contactCacheVer = ver;
+        return rows;
+    }
+
+    // warms the cache in the background so the Contacts tab and search open instantly
+    void preloadContacts() {
+        if (preloading || !has(Manifest.permission.READ_CONTACTS)
+                || (contactCache != null && contactCacheVer == Favs.version)) return;
+        preloading = true;
+        final int ver = Favs.version, gen = contactGen;
+        try {
+            bg.execute(() -> {
+                final List<Row> rows = buildContacts();
+                runOnUiThread(() -> {
+                    preloading = false;
+                    // drop the result if the contacts changed while it was being read
+                    if (isDestroyed() || gen != contactGen) return;
+                    if (contactCache == null || contactCacheVer != Favs.version) {
+                        contactCache = rows;
+                        contactCacheVer = ver;
+                    }
+                });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) { preloading = false; }
+    }
+
+    List<Row> buildContacts() {
         List<Row> rows = new ArrayList<>();
-        if (!has(Manifest.permission.READ_CONTACTS)) { contactCache = rows; return rows; }
+        if (!has(Manifest.permission.READ_CONTACTS)) return rows;
         Set<String> seen = new HashSet<>();
         String NAME = ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME;
         String NUM = ContactsContract.CommonDataKinds.Phone.NUMBER;
@@ -1269,7 +1386,6 @@ public class MainActivity extends Activity {
                 rows.add(r);
             }
         } catch (Exception e) { }
-        contactCache = rows;
         return rows;
     }
 
@@ -1331,7 +1447,7 @@ public class MainActivity extends Activity {
     void voicemail() {
         message("📨", "Voicemail", "Call your voicemail to listen to your messages.",
                 "Call voicemail", () -> {
-                    if (!has(Manifest.permission.CALL_PHONE)) { requestPermissions(PERMS, 2); return; }
+                    if (!has(Manifest.permission.CALL_PHONE)) { SpeedDial.pendingKey = "1"; requestPermissions(PERMS, 2); return; }
                     try {
                         startActivity(new Intent(Intent.ACTION_CALL, Uri.fromParts("voicemail", "", null)));
                     } catch (Throwable e) { toast("Voicemail is not available on this SIM"); }
@@ -1341,7 +1457,7 @@ public class MainActivity extends Activity {
     // ================= more =================
 
     void callVoicemail() {
-        if (!has(Manifest.permission.CALL_PHONE)) { requestPermissions(PERMS, 2); return; }
+        if (!has(Manifest.permission.CALL_PHONE)) { SpeedDial.pendingKey = "1"; requestPermissions(PERMS, 2); return; }
         try {
             startActivity(new Intent(Intent.ACTION_CALL, Uri.fromParts("voicemail", "", null)));
         } catch (Throwable e) { toast("Voicemail is not available on this SIM"); }

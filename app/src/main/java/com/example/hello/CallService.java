@@ -18,13 +18,17 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.speech.tts.TextToSpeech;
 import android.telecom.Call;
+import android.telecom.CallAudioState;
 import android.telecom.InCallService;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class CallService extends InCallService {
     static final String CH = "calls_silent";
@@ -33,7 +37,10 @@ public class CallService extends InCallService {
     public static Call current;
     public static Runnable onChange;
     public static final List<Call> calls = new ArrayList<>();
+    // display names, so the contacts database is queried once per call instead of on every refresh
+    static final Map<Call, String> names = new HashMap<>();
 
+    PowerManager.WakeLock proxLock;
     Ringtone ringtone;
     Vibrator vibrator;
     SensorManager sm;
@@ -63,9 +70,10 @@ public class CallService extends InCallService {
             if (!anyRinging()) stopRinging();
             recompute();
             if (current != null) showNotification(current);
+            updateProximity();
             notifyUi();
         }
-        @Override public void onDetailsChanged(Call c, Call.Details d) { notifyUi(); }
+        @Override public void onDetailsChanged(Call c, Call.Details d) { names.remove(c); notifyUi(); }
         @Override public void onChildrenChanged(Call c, List<Call> children) { notifyUi(); }
     };
 
@@ -102,6 +110,15 @@ public class CallService extends InCallService {
     static String who(Call c) {
         Call.Details d = c.getDetails();
         if (d.hasProperty(Call.Details.PROPERTY_CONFERENCE)) return "Conference call";
+        String cached = names.get(c);
+        if (cached != null) return cached;
+        String out = resolveName(d);
+        // don't remember a number-only answer given before the service was ready to look the name up
+        if (instance != null) names.put(c, out);
+        return out;
+    }
+
+    static String resolveName(Call.Details d) {
         if (d.getCallerDisplayName() != null && !d.getCallerDisplayName().isEmpty())
             return d.getCallerDisplayName();
         if (d.getHandle() != null) {
@@ -113,6 +130,75 @@ public class CallService extends InCallService {
             return num;
         }
         return "Unknown";
+    }
+
+    // Keeps the screen off while the phone is held to the ear (earpiece only).
+    // Lives in the service, not the activity, so it survives the activity pausing when the screen goes dark.
+    void updateProximity() {
+        boolean want = false;
+        try {
+            Call c = current;
+            if (c != null) {
+                int s = c.getState();
+                boolean live = s == Call.STATE_ACTIVE || s == Call.STATE_DIALING || s == Call.STATE_CONNECTING;
+                CallAudioState as = getCallAudioState();
+                int route = as == null ? CallAudioState.ROUTE_EARPIECE : as.getRoute();
+                want = live && route == CallAudioState.ROUTE_EARPIECE;
+            }
+        } catch (Throwable e) { want = false; }
+        try {
+            if (want) {
+                if (proxLock == null) {
+                    PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                    if (pm == null || !pm.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) return;
+                    proxLock = pm.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "dialer:proximity");
+                    proxLock.setReferenceCounted(false);
+                }
+                if (!proxLock.isHeld()) proxLock.acquire(4 * 60 * 60 * 1000L);
+            } else if (proxLock != null && proxLock.isHeld()) {
+                proxLock.release(PowerManager.RELEASE_FLAG_WAIT_FOR_NO_PROXIMITY);
+            }
+        } catch (Throwable e) { }
+    }
+
+    @Override
+    public void onCallAudioStateChanged(CallAudioState audioState) {
+        updateProximity();
+        notifyUi();
+    }
+
+    // Do Not Disturb: the system no longer rings for us once we play our own ringtone, so honour it here.
+    boolean dndAllows(String number) {
+        try {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm == null) return true;
+            int f = nm.getCurrentInterruptionFilter();
+            if (f == NotificationManager.INTERRUPTION_FILTER_NONE
+                    || f == NotificationManager.INTERRUPTION_FILTER_ALARMS) return false;
+            if (f != NotificationManager.INTERRUPTION_FILTER_PRIORITY) return true;
+            NotificationManager.Policy p = nm.getNotificationPolicy();
+            if ((p.priorityCategories & NotificationManager.Policy.PRIORITY_CATEGORY_CALLS) == 0) return false;
+            if (p.priorityCallSenders == NotificationManager.Policy.PRIORITY_SENDERS_ANY) return true;
+            if (number == null || number.isEmpty()) return false;
+            if (p.priorityCallSenders == NotificationManager.Policy.PRIORITY_SENDERS_STARRED) return Favs.has(this, number);
+            return !Ui.lookupName(this, number).isEmpty();
+        } catch (Throwable e) { return true; }
+    }
+
+    Ringtone tryPlay(Uri uri) {
+        try {
+            if (uri == null) return null;
+            Ringtone r = RingtoneManager.getRingtone(this, uri);
+            if (r == null) return null;
+            r.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
+            r.setLooping(true);
+            r.play();
+            if (r.isPlaying()) return r;
+            r.stop();
+        } catch (Throwable e) { }
+        return null;
     }
 
     boolean pref(String k) {
@@ -133,6 +219,16 @@ public class CallService extends InCallService {
     public void onDestroy() {
         stopRinging();
         try { if (tts != null) { tts.shutdown(); tts = null; } } catch (Throwable e) { }
+        for (Call c : new ArrayList<>(calls)) {
+            try { c.unregisterCallback(cb); } catch (Throwable e) { }
+        }
+        calls.clear();
+        names.clear();
+        current = null;
+        hh.removeCallbacksAndMessages(null);
+        try { if (proxLock != null && proxLock.isHeld()) proxLock.release(); } catch (Throwable e) { }
+        proxLock = null;
+        if (instance == this) instance = null;
         super.onDestroy();
     }
 
@@ -143,22 +239,17 @@ public class CallService extends InCallService {
         if (mode == AudioManager.RINGER_MODE_SILENT) return;
         boolean normal = mode == AudioManager.RINGER_MODE_NORMAL;
         String num = numberOf(current);
+        if (!dndAllows(num)) return;
 
         try {
             if (normal && pref("ringtone")) {
                 String tok = Ring.pick(this, num);
                 if (!"silent".equals(tok)) {
-                    Uri uri = tok.isEmpty()
-                            ? RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_RINGTONE)
-                            : Uri.parse(tok);
-                    ringtone = RingtoneManager.getRingtone(this, uri);
-                    if (ringtone != null) {
-                        ringtone.setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
-                        ringtone.setLooping(true);
-                        ringtone.play();
-                    }
+                    Uri def = RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_RINGTONE);
+                    Uri uri = tok.isEmpty() ? def : Uri.parse(tok);
+                    ringtone = tryPlay(uri);
+                    // a missing or unreadable custom tone must never mean a silent phone
+                    if (ringtone == null && def != null && !def.equals(uri)) ringtone = tryPlay(def);
                 }
             }
         } catch (Throwable e) { }
@@ -229,6 +320,7 @@ public class CallService extends InCallService {
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(i);
         }
+        updateProximity();
         notifyUi();
     }
 
@@ -236,8 +328,10 @@ public class CallService extends InCallService {
     public void onCallRemoved(Call call) {
         call.unregisterCallback(cb);
         calls.remove(call);
+        names.remove(call);
         if (!anyRinging()) stopRinging();
         recompute();
+        updateProximity();
         if (current == null) {
             getSystemService(NotificationManager.class).cancel(NID);
         } else {

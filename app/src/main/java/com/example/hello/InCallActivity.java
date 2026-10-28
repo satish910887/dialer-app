@@ -1,12 +1,13 @@
 package com.example.hello;
 
+import android.Manifest;
 import android.app.Activity;
-import android.app.AlarmManager;
 import android.app.AlertDialog;
-import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,6 +21,8 @@ import android.view.View;
 import android.view.animation.Animation;
 import android.view.animation.ScaleAnimation;
 import android.widget.*;
+import java.util.ArrayList;
+import java.util.List;
 
 public class InCallActivity extends Activity {
     static final int MATCH = -1, WRAP = -2;
@@ -39,6 +42,10 @@ public class InCallActivity extends Activity {
     Handler h = new Handler(Looper.getMainLooper());
     Runnable tick = new Runnable() {
         @Override public void run() { refresh(); h.postDelayed(this, 1000); }
+    };
+    // closes the screen shortly after a call ends; cancelled if another call shows up in the meantime
+    final Runnable finisher = new Runnable() {
+        @Override public void run() { finish(); }
     };
 
     int dp(float v) { return Ui.dp(this, v); }
@@ -390,6 +397,7 @@ public class InCallActivity extends Activity {
             CallService svc = CallService.instance;
             if (svc == null) return;
             CallAudioState as = svc.getCallAudioState();
+            if (as != null && hasRouteChoice(as)) { routeDialog(svc, as.getSupportedRouteMask()); return; }
             boolean spk = as != null && as.getRoute() == CallAudioState.ROUTE_SPEAKER;
             svc.setAudioRoute(spk ? CallAudioState.ROUTE_WIRED_OR_EARPIECE : CallAudioState.ROUTE_SPEAKER);
             setOn(2, !spk);
@@ -406,6 +414,24 @@ public class InCallActivity extends Activity {
             else { c.hold(); setOn(4, true); }
         });
         ctl[5].setOnClickListener(v -> sms());
+    }
+
+    // true when a Bluetooth or wired headset is connected, so a plain speaker on/off toggle is not enough
+    static boolean hasRouteChoice(CallAudioState as) {
+        return (as.getSupportedRouteMask()
+                & (CallAudioState.ROUTE_BLUETOOTH | CallAudioState.ROUTE_WIRED_HEADSET)) != 0;
+    }
+
+    void routeDialog(CallService svc, int mask) {
+        final List<Integer> routes = new ArrayList<>();
+        final List<String> labels = new ArrayList<>();
+        if ((mask & CallAudioState.ROUTE_EARPIECE) != 0) { routes.add(CallAudioState.ROUTE_EARPIECE); labels.add("Phone"); }
+        if ((mask & CallAudioState.ROUTE_WIRED_HEADSET) != 0) { routes.add(CallAudioState.ROUTE_WIRED_HEADSET); labels.add("Wired headset"); }
+        if ((mask & CallAudioState.ROUTE_BLUETOOTH) != 0) { routes.add(CallAudioState.ROUTE_BLUETOOTH); labels.add("Bluetooth"); }
+        if ((mask & CallAudioState.ROUTE_SPEAKER) != 0) { routes.add(CallAudioState.ROUTE_SPEAKER); labels.add("Speaker"); }
+        new AlertDialog.Builder(this).setTitle("Audio output")
+                .setItems(labels.toArray(new String[0]), (d, i) -> svc.setAudioRoute(routes.get(i)))
+                .setNegativeButton("Cancel", null).show();
     }
 
     void updateWaiting(Call c) {
@@ -488,12 +514,14 @@ public class InCallActivity extends Activity {
         new AlertDialog.Builder(this).setTitle("Remind me to call back")
                 .setItems(opts, (d, i) -> {
                     long at = System.currentTimeMillis() + mins[i] * 60000L;
-                    Intent in = new Intent(this, CallReceiver.class).setAction("REMIND")
-                            .putExtra("who", name.getText().toString()).putExtra("number", number);
-                    PendingIntent pi = PendingIntent.getBroadcast(this, (int) (at % 1000000), in,
-                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                    ((AlarmManager) getSystemService(ALARM_SERVICE)).set(AlarmManager.RTC_WAKEUP, at, pi);
-                    Toast.makeText(this, "Reminder set", Toast.LENGTH_SHORT).show();
+                    Reminders.add(this, at, name.getText().toString(), number);
+                    if (Build.VERSION.SDK_INT >= 33
+                            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        Toast.makeText(this, "Reminder set. Allow notifications to see it", Toast.LENGTH_LONG).show();
+                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 5);
+                    } else {
+                        Toast.makeText(this, "Reminder set", Toast.LENGTH_SHORT).show();
+                    }
                     Call c = CallService.current;
                     if (c != null && c.getState() == Call.STATE_RINGING) c.reject(false, null);
                 }).show();
@@ -556,14 +584,6 @@ public class InCallActivity extends Activity {
             a.setRepeatCount(Animation.INFINITE);
             avatar.startAnimation(a);
             ring.setVisibility(View.VISIBLE);
-            android.view.animation.AnimationSet set = new android.view.animation.AnimationSet(true);
-            ScaleAnimation sc = new ScaleAnimation(1f, 1.45f, 1f, 1.45f,
-                    Animation.RELATIVE_TO_SELF, .5f, Animation.RELATIVE_TO_SELF, .5f);
-            android.view.animation.AlphaAnimation al = new android.view.animation.AlphaAnimation(0.8f, 0f);
-            set.addAnimation(sc);
-            set.addAnimation(al);
-            set.setDuration(1400);
-            set.setRepeatCount(Animation.INFINITE);
             ring.startAnimation(ringAnim(0));
             ring2.setVisibility(View.VISIBLE);
             ring2.startAnimation(ringAnim(600));
@@ -582,6 +602,7 @@ public class InCallActivity extends Activity {
 
     void refresh() {
         Call c = CallService.current;
+        if (c != null) h.removeCallbacks(finisher);
         if (c == null) {
             if (shown == null) { finish(); return; }
             if (ending) return;
@@ -592,7 +613,7 @@ public class InCallActivity extends Activity {
             ringRow.setVisibility(View.GONE);
             quickRow.setVisibility(View.GONE);
             activeRow.setVisibility(View.INVISIBLE);
-            h.postDelayed(this::finish, 1500);
+            h.postDelayed(finisher, 1500);
             return;
         }
         if (c != shown) {
@@ -649,7 +670,10 @@ public class InCallActivity extends Activity {
             CallAudioState as = CallService.instance != null
                     ? CallService.instance.getCallAudioState() : null;
             setOn(0, as != null && as.isMuted());
-            setOn(2, as != null && as.getRoute() == CallAudioState.ROUTE_SPEAKER);
+            boolean multi = as != null && hasRouteChoice(as);
+            int route = as == null ? 0 : as.getRoute();
+            lbl[2].setText(multi ? "Audio" : "Speaker");
+            setOn(2, route == CallAudioState.ROUTE_SPEAKER || (multi && route == CallAudioState.ROUTE_BLUETOOTH));
             setOn(4, st == Call.STATE_HOLDING);
             setOn(1, padOpen);
         }

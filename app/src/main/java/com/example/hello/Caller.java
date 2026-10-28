@@ -92,8 +92,7 @@ public class Caller {
             if (h != null) i.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, h);
             a.startActivity(i);
         } catch (Throwable e) {
-            Toast.makeText(a, "Call error: " + e.getClass().getSimpleName() + " " + e.getMessage(),
-                    Toast.LENGTH_LONG).show();
+            Toast.makeText(a, "Couldn't place the call", Toast.LENGTH_LONG).show();
         }
     }
 }

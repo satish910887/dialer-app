@@ -30,15 +30,16 @@ public class CallReceiver extends BroadcastReceiver {
                     .setContentText("You asked to be reminded. Tap to call.")
                     .setAutoCancel(true).setContentIntent(pi).build();
             nm.notify((int) (System.currentTimeMillis() % 100000) + 100, n);
+            Reminders.done(ctx, i.getIntExtra("id", -1));
             return;
         }
         Call call = CallService.current;
         if (call == null) return;
         if ("ANSWER".equals(a)) {
             call.answer(VideoProfile.STATE_AUDIO_ONLY);
-            Intent ui = new Intent(ctx, InCallActivity.class);
-            ui.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            ctx.startActivity(ui);
+            // opened by the in-call service: a plain receiver is not allowed to start an activity from the background
+            CallService svc = CallService.instance;
+            if (svc != null) svc.launchUi();
         } else if ("DECLINE".equals(a)) {
             call.reject(false, null);
         } else if ("END".equals(a)) {

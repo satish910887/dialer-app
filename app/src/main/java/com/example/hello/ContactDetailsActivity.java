@@ -223,7 +223,7 @@ public class ContactDetailsActivity extends Activity {
             toast("Photo removed");
             recreate();
         } catch (Exception e) {
-            toast("Couldn't remove photo: " + e.getMessage());
+            toast("Couldn't remove the photo");
         }
     }
 
@@ -287,7 +287,7 @@ public class ContactDetailsActivity extends Activity {
             }
             return null;
         } catch (Throwable e) {
-            return String.valueOf(e.getMessage());
+            return "unexpected error";
         }
     }
 
@@ -363,13 +363,12 @@ public class ContactDetailsActivity extends Activity {
 
     void loadHistory(LinearLayout hist) {
         String digits = number.replaceAll("[^0-9]", "");
-        String tail = digits.length() > 10 ? digits.substring(digits.length() - 10) : digits;
         int count = 0;
-        if (!tail.isEmpty() && checkSelfPermission(Manifest.permission.READ_CALL_LOG)
+        if (!digits.isEmpty() && checkSelfPermission(Manifest.permission.READ_CALL_LOG)
                 == PackageManager.PERMISSION_GRANTED) {
             try (Cursor c = getContentResolver().query(CallLog.Calls.CONTENT_URI,
                     new String[]{CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION},
-                    CallLog.Calls.NUMBER + " LIKE ?", new String[]{"%" + tail},
+                    Favs.logSel(number), Favs.logArgs(number),
                     CallLog.Calls.DATE + " DESC")) {
                 while (c != null && c.moveToNext() && count < 30) {
                     int type = c.getInt(0);

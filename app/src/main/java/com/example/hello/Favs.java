@@ -2,6 +2,7 @@ package com.example.hello;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.provider.CallLog;
 import android.text.TextUtils;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -10,6 +11,9 @@ import java.util.List;
 import java.util.Map;
 
 public class Favs {
+    // bumped whenever favourites change, so cached lists that show a star can tell they are out of date
+    public static volatile int version = 0;
+
     static SharedPreferences p(Context c) {
         return c.getSharedPreferences("favs", Context.MODE_PRIVATE);
     }
@@ -17,6 +21,28 @@ public class Favs {
     static String key(String n) {
         String d = n == null ? "" : n.replaceAll("[^0-9]", "");
         return d.length() > 10 ? d.substring(d.length() - 10) : d;
+    }
+
+    // Call-log matching. A full number is matched on its last 10 digits so "+91 98..." and "098..." are the same
+    // person, but a short number (121, 1800...) must match exactly, or it would also match every number that
+    // merely ends in those digits.
+    static boolean isShort(String n) {
+        String d = n == null ? "" : n.replaceAll("[^0-9]", "");
+        return d.length() < 10;
+    }
+
+    public static String logSel(String n) {
+        if (isShort(n)) {
+            return "(" + CallLog.Calls.NUMBER + "=? OR " + CallLog.Calls.NUMBER + "=?)";
+        }
+        return CallLog.Calls.NUMBER + " LIKE ?";
+    }
+
+    public static String[] logArgs(String n) {
+        String raw = n == null ? "" : n;
+        String d = raw.replaceAll("[^0-9]", "");
+        if (d.length() < 10) return new String[]{raw, d.isEmpty() ? raw : d};
+        return new String[]{"%" + d.substring(d.length() - 10)};
     }
 
     public static boolean has(Context c, String n) {
@@ -38,6 +64,7 @@ public class Favs {
     public static boolean toggle(Context c, String n, String name) {
         String k = key(n);
         if (k.isEmpty()) return false;
+        version++;
         List<String> o = order(c);
         if (p(c).contains(k)) {
             o.remove(k);
@@ -52,6 +79,7 @@ public class Favs {
     }
 
     public static void remove(Context c, String k) {
+        version++;
         List<String> o = order(c);
         o.remove(k);
         p(c).edit().remove(k).putString("_order", TextUtils.join(",", o)).apply();

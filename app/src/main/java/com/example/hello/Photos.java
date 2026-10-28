@@ -15,13 +15,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Photos {
-    static final LruCache<String, Bitmap> CACHE = new LruCache<>(80);
+    // Sized by memory (1/16 of the app heap, counted in KB) rather than by number of entries,
+    // so large photos cannot use up far more memory than intended.
+    static final LruCache<String, Bitmap> CACHE = new LruCache<String, Bitmap>(
+            (int) Math.max(1024L, Runtime.getRuntime().maxMemory() / 1024 / 16)) {
+        @Override protected int sizeOf(String key, Bitmap b) { return Math.max(1, b.getByteCount() / 1024); }
+    };
     static final Bitmap NONE = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
     static final ExecutorService POOL = Executors.newFixedThreadPool(3);
 
     static class Circle extends Drawable {
         final Bitmap b;
         final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Matrix m = new Matrix();
         final BitmapShader sh;
 
         Circle(Bitmap b) {
@@ -34,7 +40,6 @@ public class Photos {
             Rect r = getBounds();
             if (r.isEmpty()) return;
             float s = Math.max((float) r.width() / b.getWidth(), (float) r.height() / b.getHeight());
-            Matrix m = new Matrix();
             m.setScale(s, s);
             m.postTranslate(r.left + (r.width() - b.getWidth() * s) / 2f,
                     r.top + (r.height() - b.getHeight() * s) / 2f);
@@ -56,6 +61,13 @@ public class Photos {
     public static void bind(Context c, TextView v, String number, String photoUri, boolean full) {
         String id = (photoUri != null && !photoUri.isEmpty()) ? photoUri : number;
         if (id == null || id.length() < 3) { v.setTag(null); return; }
+        // Without the Contacts permission nothing can be looked up yet. Don't remember that as "no photo",
+        // or the photo would stay missing even after the permission is granted.
+        if ((photoUri == null || photoUri.isEmpty())
+                && c.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            v.setTag(null);
+            return;
+        }
         final String key = (full ? "f|" : "t|") + id;
         v.setTag(key);
         Bitmap hit = CACHE.get(key);
@@ -66,8 +78,9 @@ public class Photos {
         final Context app = c.getApplicationContext();
         POOL.execute(() -> {
             Bitmap b = load(app, number, photoUri, full);
-            CACHE.put(key, b == null ? NONE : b);
-            if (b != null) v.post(() -> { if (key.equals(v.getTag())) apply(v, b); });
+            if (b == null) return; // lookup failed this time; try again next time instead of caching "no photo"
+            CACHE.put(key, b);
+            if (b != NONE) v.post(() -> { if (key.equals(v.getTag())) apply(v, b); });
         });
     }
 
@@ -85,7 +98,7 @@ public class Photos {
                 if (cur != null && cur.moveToFirst()) u = cur.getString(0);
             } catch (Exception e) { return null; }
         }
-        if (u == null || u.isEmpty()) return null;
+        if (u == null || u.isEmpty()) return NONE; // this contact really has no photo
         try {
             Uri uri = Uri.parse(u);
             BitmapFactory.Options o = new BitmapFactory.Options();
@@ -96,7 +109,14 @@ public class Photos {
             while (o.outWidth / (s * 2) >= target && o.outHeight / (s * 2) >= target) s *= 2;
             o.inJustDecodeBounds = false;
             o.inSampleSize = s;
-            try (InputStream is = cr.openInputStream(uri)) { return BitmapFactory.decodeStream(is, null, o); }
-        } catch (Throwable e) { return null; }
+            try (InputStream is = cr.openInputStream(uri)) {
+                Bitmap out = BitmapFactory.decodeStream(is, null, o);
+                return out == null ? NONE : out;
+            }
+        } catch (OutOfMemoryError e) {
+            return null; // may work later
+        } catch (Throwable e) {
+            return NONE; // unreadable photo: don't keep retrying it
+        }
     }
 }

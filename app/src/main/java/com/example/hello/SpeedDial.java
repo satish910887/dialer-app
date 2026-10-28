@@ -15,14 +15,19 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class SpeedDial {
+    // the digit that was pressed while the Phone permission was still missing; dialled once it is granted
+    public static String pendingKey;
+
     static SharedPreferences sp(Activity a) { return a.getSharedPreferences("app", Activity.MODE_PRIVATE); }
 
     public static void press(Activity a, String d) {
         if (d.equals("1")) {
             if (a.checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                pendingKey = "1";
                 a.requestPermissions(new String[]{Manifest.permission.CALL_PHONE}, 2);
                 return;
             }
+            pendingKey = null;
             try { a.startActivity(new Intent(Intent.ACTION_CALL, Uri.fromParts("voicemail", "", null))); }
             catch (Throwable e) { Toast.makeText(a, "Voicemail is not available on this SIM", Toast.LENGTH_SHORT).show(); }
             return;

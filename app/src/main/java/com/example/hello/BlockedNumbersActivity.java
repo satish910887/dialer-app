@@ -101,12 +101,21 @@ public class BlockedNumbersActivity extends Activity {
                 render();
             });
         } else if (tab == 1) {
-            ask("Add rule", "Prefix like 140, or a name word", false, s -> {
+            ask("Add rule", "Prefix like 140, or a caller ID word", false, s -> {
+                // a very short prefix (like 91, the country code) would block almost everyone
+                if (s.matches("[0-9+ ]+") && SpamGuard.digits(s).length() < 3) {
+                    toast("A number prefix needs at least 3 digits");
+                    return;
+                }
                 SpamGuard.addKeyword(this, s);
                 render();
             });
         } else {
             ask("Report spam number", "Phone number", true, s -> {
+                if (SpamGuard.key(s).isEmpty()) {
+                    toast("Enter a valid phone number");
+                    return;
+                }
                 SpamGuard.report(this, s);
                 render();
             });
@@ -166,11 +175,13 @@ public class BlockedNumbersActivity extends Activity {
     void keywords() {
         List<String> kws = SpamGuard.keywords(this);
         if (kws.isEmpty()) {
-            empty("No rules yet.\nAdd a number prefix (like 140) or a word in the caller name.");
+            empty("No rules yet.\nAdd a number prefix (like 140) or a word in the caller ID name.\n"
+                    + "Word rules only work when the network sends a name with the call.\n"
+                    + "People saved in your contacts are never blocked by rules.");
             return;
         }
         for (String k : kws) {
-            addRow(k, k.matches("[0-9+ ]+") ? "Number starts with" : "Caller name contains",
+            addRow(k, k.matches("[0-9+ ]+") ? "Number starts with" : "Caller ID name contains",
                     "Remove", Ui.RED, () -> { SpamGuard.removeKeyword(this, k); render(); });
         }
     }

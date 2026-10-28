@@ -61,6 +61,11 @@ public class SpamGuard {
         sp(c).edit().remove("k:" + kw).apply();
     }
 
+    static boolean isSaved(Context c, String number) {
+        return c.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+                && !Ui.lookupName(c, number).isEmpty();
+    }
+
     // returns null if the call is allowed, otherwise the reason it is blocked
     public static String reason(Context c, String number, String name) {
         if (!enabled(c)) return null;
@@ -73,11 +78,15 @@ public class SpamGuard {
         String nm = name == null ? "" : name.toLowerCase(Locale.ROOT);
         for (String kw : keywords(c)) {
             String kd = digits(kw);
+            boolean hit = false;
             if (!kd.isEmpty() && kw.matches("[0-9+ ]+")) {
-                if (nd.startsWith(kd) || local.startsWith(kd)) return "Matches rule " + kw;
+                hit = nd.startsWith(kd) || local.startsWith(kd);
             } else if (!nm.isEmpty() && nm.contains(kw.toLowerCase(Locale.ROOT))) {
-                return "Matches rule " + kw;
+                hit = true;
             }
+            // Prefix and word rules are for strangers. Someone saved in Contacts is never silenced by them
+            // (block that person directly if you really want to).
+            if (hit && !isSaved(c, number)) return "Matches rule " + kw;
         }
         if (ap(c).getBoolean("block_unknown", false) && nd.length() >= 6
                 && c.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED

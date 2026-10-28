@@ -20,12 +20,25 @@ import android.widget.Toast;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.json.JSONObject;
 
 public class SettingsActivity extends Activity {
     static final String[] STORES = {"app", "favs", "spam", "cring", "notes"};
+    // The settings the "app" store may hold, by type. A restored file is only trusted for these keys and types:
+    // a value of the wrong type would crash the first screen that reads it.
+    static final Set<String> INT_KEYS = new HashSet<>(Arrays.asList(
+            "theme", "accent", "font", "vibe_pattern", "gesture", "sim", "wall_v", "wall_dim", "blocked_count"));
+    static final Set<String> BOOL_KEYS = new HashSet<>(Arrays.asList(
+            "animations", "splash", "vibration", "tones", "ringtone", "ring_vibe", "flip_silence", "announce",
+            "assist_on", "card_on", "applock", "a11y_contrast", "a11y_bold", "a11y_speak",
+            "spam_on", "block_unknown", "block_hidden", "onboarded"));
+    static final Set<String> STR_KEYS = new HashSet<>(Arrays.asList("ringtone_uri", "assist_cc"));
     static final String[] GESTURES = {"Buttons only", "Swipe up to answer, down to decline", "Swipe right to answer, left to decline", "Slide the knob to answer or decline"};
     LinearLayout list;
     String secIcon = "⚙️";
@@ -88,6 +101,8 @@ public class SettingsActivity extends Activity {
         toggle("Calling card", "Add your card access number before every call", "card_on", false);
         row("Calling card number", sp.getString("card_num", "").isEmpty() ? "Not set" : sp.getString("card_num", ""), this::cardDialog);
         row("Speed dial", "Long-press keypad digits 2-9 to call", () -> SpeedDial.manage(this));
+        int pendingReminders = Reminders.list(this).size();
+        row("Call-back reminders", pendingReminders == 0 ? "None set" : pendingReminders + " pending", this::remindersDialog);
         row("Favorites", "Your starred contacts",
                 () -> startActivity(new Intent(this, FavoritesActivity.class)));
         row("Spam protection", "Block spam and unwanted calls",
@@ -388,6 +403,8 @@ public class SettingsActivity extends Activity {
             for (String f : STORES) {
                 JSONObject o = new JSONObject();
                 for (Map.Entry<String, ?> e : getSharedPreferences(f, MODE_PRIVATE).getAll().entrySet()) {
+                    // the calling card number can work like a PIN, so it stays out of a plain-text file in Downloads
+                    if (f.equals("app") && e.getKey().equals("card_num")) continue;
                     o.put(e.getKey(), e.getValue());
                 }
                 root.put(f, o);
@@ -403,8 +420,51 @@ public class SettingsActivity extends Activity {
             }
             toast("Saved to Downloads/dialer-backup.json");
         } catch (Exception e) {
-            toast("Backup failed: " + e.getMessage());
+            toast("Couldn't save the backup");
         }
+    }
+
+    // Returns the value to store (already the right type), or null if this key/value must not be restored.
+    static Object coerce(String store, String key, Object v) {
+        if (!store.equals("app")) return v instanceof String ? v : null;
+        if (key.equals("card_num")) return null; // never taken from a file
+        if (INT_KEYS.contains(key) || key.startsWith("wall_mode_")) {
+            return v instanceof Number ? (Object) ((Number) v).intValue() : null;
+        }
+        if (BOOL_KEYS.contains(key)) return v instanceof Boolean ? v : null;
+        if (STR_KEYS.contains(key) || key.startsWith("qr_") || key.startsWith("sd_")) {
+            return v instanceof String ? v : null;
+        }
+        return null;
+    }
+
+    void remindersDialog() {
+        final List<String[]> items = Reminders.list(this);
+        if (items.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("Call-back reminders")
+                    .setMessage("No reminders are set. Use \"Remind me\" on the incoming call screen.")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        String[] labels = new String[items.size()];
+        for (int i = 0; i < labels.length; i++) {
+            String[] r = items.get(i);
+            String who = r[2].isEmpty() ? r[3] : r[2];
+            String when = "";
+            try {
+                when = android.text.format.DateUtils.formatDateTime(this, Long.parseLong(r[1]),
+                        android.text.format.DateUtils.FORMAT_SHOW_DATE | android.text.format.DateUtils.FORMAT_ABBREV_MONTH
+                                | android.text.format.DateUtils.FORMAT_SHOW_TIME);
+            } catch (NumberFormatException ignored) { }
+            labels[i] = who + "  ·  " + when;
+        }
+        new AlertDialog.Builder(this).setTitle("Tap a reminder to cancel it")
+                .setItems(labels, (d, i) -> {
+                    try { Reminders.cancel(this, Integer.parseInt(items.get(i)[0])); }
+                    catch (NumberFormatException ignored) { }
+                    toast("Reminder cancelled");
+                    recreate();
+                }).setNegativeButton("Close", null).show();
     }
 
     void restore() {
@@ -440,7 +500,10 @@ public class SettingsActivity extends Activity {
             ByteArrayOutputStream bo = new ByteArrayOutputStream();
             byte[] buf = new byte[8192];
             int n;
-            while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
+            while ((n = is.read(buf)) > 0) {
+                bo.write(buf, 0, n);
+                if (bo.size() > 2 * 1024 * 1024) throw new IllegalArgumentException("not a dialer backup");
+            }
             JSONObject root = new JSONObject(bo.toString("UTF-8"));
             for (String f : STORES) {
                 JSONObject o = root.optJSONObject(f);
@@ -450,18 +513,18 @@ public class SettingsActivity extends Activity {
                 Iterator<String> it = o.keys();
                 while (it.hasNext()) {
                     String k = it.next();
-                    Object v = o.get(k);
+                    Object v = coerce(f, k, o.get(k));
                     if (v instanceof Boolean) ed.putBoolean(k, (Boolean) v);
                     else if (v instanceof Integer) ed.putInt(k, (Integer) v);
-                    else if (v instanceof Long) ed.putLong(k, (Long) v);
                     else if (v instanceof String) ed.putString(k, (String) v);
                 }
                 ed.apply();
             }
+            Favs.version++; // favourites may have changed, so cached lists must be rebuilt
             toast("Backup restored");
             recreate();
         } catch (Exception e) {
-            toast("Restore failed: " + e.getMessage());
+            toast("Couldn't restore: that doesn't look like a Dialer backup");
         }
     }
 }
