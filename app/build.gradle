@@ -1,0 +1,12 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.example.hello'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.example.hello"
+        minSdk 29
+        targetSdk 34
+        versionCode 11
+        versionName "1.6"
+    }
+}
