@@ -3,3 +3,8 @@ build/
 local.properties
 *.apk
 .idea/
+
+# release signing: keep keys and passwords out of git
+keystore.properties
+*.jks
+*.keystore

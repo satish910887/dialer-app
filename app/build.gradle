@@ -1,4 +1,10 @@
 plugins { id 'com.android.application' }
+
+// Release signing: the key and passwords stay on your own device in keystore.properties (never committed).
+def keystoreFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystoreFile.exists()) keystoreFile.withInputStream { keystoreProps.load(it) }
+
 android {
     namespace 'com.example.hello'
     compileSdk 34
@@ -10,6 +16,24 @@ android {
         versionName "1.6"
     }
     testOptions { unitTests.returnDefaultValues = true }
+
+    signingConfigs {
+        release {
+            if (keystoreFile.exists()) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+    buildTypes {
+        release {
+            // without keystore.properties the release build is simply unsigned, debug builds are unaffected
+            if (keystoreFile.exists()) signingConfig signingConfigs.release
+            minifyEnabled false
+        }
+    }
 }
 dependencies {
     testImplementation 'junit:junit:4.13.2'
